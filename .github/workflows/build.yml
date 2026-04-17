@@ -1,17 +1,18 @@
 name: Builds
 on: workflow_dispatch
 
-# Declare default permissions as read only.
-permissions: read-all
+# Need write access to create/update release
+permissions:
+  contents: write
 
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: ["appbundle --debug", "ios --no-codesign"]
+        target: ["apk --release"]
     steps:
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -21,10 +22,47 @@ jobs:
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
+        with:
+          cache: true
       - run: flutter doctor -v
 
       - name: Checkout mobile code
         uses: actions/checkout@v6
+
+      # Cache the pub package download directory so `flutter pub get` skips
+      # re-downloading every dependency on subsequent runs.
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      # Cache Gradle + the Stockfish CMake build outputs. Stockfish is compiled
+      # from C++ source for every Android ABI on each fresh runner (~6 min of
+      # the ~13 min build); caching the intermediates brings cold rebuilds
+      # down to ~5 min.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            android/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties', 'pubspec.lock') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Cache build_runner's codegen output so a clean run reuses previously
+      # generated freezed / json / riverpod / l10n files when their inputs
+      # haven't changed.
+      - name: Cache build_runner output
+        uses: actions/cache@v4
+        with:
+          path: |
+            .dart_tool/build
+          key: build-runner-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'lib/**/*.dart') }}
+          restore-keys: build-runner-${{ runner.os }}-
 
       - name: Install dependencies
         run: flutter pub get
@@ -32,4 +70,27 @@ jobs:
       - name: Code generation
         run: dart run build_runner build
 
-      - run: flutter build ${{ matrix.target }}
+      - run: flutter build ${{ matrix.target }} --dart-define=LICHESS_HOST=lichess.org --dart-define=LICHESS_WS_HOST=socket.lichess.org
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichess-debug-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+
+      # Publishes the APK to a pinned GitHub release so it can be downloaded
+      # directly from the phone (bookmark-able URL) instead of round-tripping
+      # through a desktop artifact download.
+      - name: Publish APK to release (overwrite)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="lichess-debug-foldable-fix"
+          TITLE="Lichess debug APK - foldable fix"
+          BODY="Latest debug build of PR #2993 (foldable layout fix).\n\nDirect install URL: https://github.com/${{ github.repository }}/releases/download/$TAG/app-release.apk\n\nAutomatically updated on every workflow_dispatch run."
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "${{ github.repository }}" --clobber build/app/outputs/flutter-apk/app-release.apk
+          else
+            gh release create "$TAG" --repo "${{ github.repository }}" --title "$TITLE" --notes "$BODY" build/app/outputs/flutter-apk/app-release.apk
+          fi
